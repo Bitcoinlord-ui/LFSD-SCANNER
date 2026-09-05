@@ -51,7 +51,8 @@ const state = {
   connection: 'CONNECTING', assets, activeAsset: SYMBOLS[0], liveTrading: false,
   riskPerTrade: 1, maxRiskPerTrade: 10, minRR: 2, lot: 0.02,
   history: signalHistory, lastUpdate: null, uptimeStarted: new Date().toISOString(),
-  historyPersistence: { file: HISTORY_FILE, loaded: signalHistory.length, durable: false }
+  historyPersistence: { file: HISTORY_FILE, loaded: signalHistory.length, durable: false },
+  patConnected: false
 };
 
 let deriv = null;
@@ -163,12 +164,34 @@ app.get('/api/state', (req, res) => {
 });
 app.get('/api/history', (req, res) => res.json({ count: signalHistory.length, signals: signalHistory }));
 app.post('/api/live', (req, res) => { state.liveTrading = Boolean(req.body?.enabled); res.json({ liveTrading: state.liveTrading }); });
-app.post('/api/token', (req, res) => { token = typeof req.body?.token === 'string' && req.body.token ? req.body.token : null; res.json({ ok: Boolean(token), storedInMemory: true }); });
+
+// PAT support: accepts either {pat:"..."} or the legacy {token:"..."} field.
+// PATs are validated against Deriv's authenticated REST API when a current
+// DERIV_APP_ID is configured. The PAT is never persisted to signal history.
+app.post('/api/token', async (req, res) => {
+  const supplied = typeof req.body?.pat === 'string' ? req.body.pat.trim() : typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  if (!supplied) return res.status(400).json({ ok: false, error: 'Enter your Deriv PAT first.' });
+  if (!/^PAT/i.test(supplied)) return res.status(400).json({ ok: false, error: 'This field expects a Deriv PAT (Personal Access Token) beginning with PAT.' });
+  if (APP_ID === '1089') return res.status(400).json({ ok: false, error: 'PAT authentication needs your current Deriv App ID. Set DERIV_APP_ID in Railway, then reconnect the PAT.' });
+  try {
+    const r = await fetch('https://api.derivws.com/trading/v1/options/accounts', { headers: { 'Authorization': `Bearer ${supplied}`, 'Deriv-App-ID': APP_ID, 'Content-Type': 'application/json' } });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const message = body?.errors?.[0]?.message || `Deriv rejected the PAT (HTTP ${r.status}).`;
+      return res.status(r.status === 401 ? 401 : 400).json({ ok: false, error: message });
+    }
+    token = supplied;
+    state.patConnected = true;
+    return res.json({ ok: true, authenticated: true, storedInMemory: true, accountCount: Array.isArray(body?.data) ? body.data.length : undefined });
+  } catch (err) {
+    return res.status(502).json({ ok: false, error: `Unable to reach Deriv authentication API: ${err.message}` });
+  }
+});
 app.post('/api/confirm', (req, res) => {
   if (!state.liveTrading) return res.status(400).json({ error: 'Live trading is disabled' });
-  if (!token) return res.status(400).json({ error: 'Deriv token not connected' });
+  if (!token) return res.status(400).json({ error: 'Deriv PAT not connected' });
   return res.status(403).json({ error: 'Fresh per-trade confirmation is required; unattended real-money execution is disabled.' });
 });
-app.get('/health', (req, res) => res.json({ ok: true, connection: state.connection, assets: SYMBOLS, uptime: process.uptime(), signalHistoryCount: signalHistory.length, historyFile: HISTORY_FILE }));
+app.get('/health', (req, res) => res.json({ ok: true, connection: state.connection, assets: SYMBOLS, uptime: process.uptime(), signalHistoryCount: signalHistory.length, historyFile: HISTORY_FILE, patConnected: state.patConnected }));
 
 app.listen(PORT, () => { console.log(`LFSD scanner listening on ${PORT}`); console.log(`Loaded ${signalHistory.length} persisted qualified signals from ${HISTORY_FILE}`); connect(); });
