@@ -1,24 +1,59 @@
 import express from 'express';
 import { WebSocket } from 'ws';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const app = express();
 app.use(express.json());
-app.use(express.static('public'));
+
 const PORT = Number(process.env.PORT || 3000);
 const APP_ID = process.env.DERIV_APP_ID || '1089';
 const SYMBOLS = (process.env.DERIV_SYMBOLS || 'cryBTCUSD,frxXAUUSD').split(',').map(s => s.trim()).filter(Boolean);
-const assets = Object.fromEntries(SYMBOLS.map((symbol, i) => [symbol, {
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const HISTORY_FILE = path.join(DATA_DIR, 'signal-history.json');
+
+function loadSignalHistory() {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return [];
+    const parsed = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    console.error('Signal history load failed:', err.message);
+    return [];
+  }
+}
+
+let signalHistory = loadSignalHistory();
+const signalKeys = new Set(signalHistory.map(x => x.signalKey).filter(Boolean));
+
+function persistSignal() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${HISTORY_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(signalHistory, null, 2), 'utf8');
+    fs.renameSync(tmp, HISTORY_FILE);
+    return true;
+  } catch (err) {
+    console.error('Signal history persist failed:', err.message);
+    return false;
+  }
+}
+
+const assets = Object.fromEntries(SYMBOLS.map(symbol => [symbol, {
   symbol,
   name: symbol === 'frxXAUUSD' ? 'GOLD' : symbol === 'cryBTCUSD' ? 'BTC/USD' : symbol,
   connection: 'CONNECTING', price: null, change24h: null,
   candles5: [], candles15: [], activeZone: null, setupStatus: 'WAITING', signal: null,
   lastUpdate: null, lastSignalKey: null, history: []
 }]));
+
 const state = {
   connection: 'CONNECTING', assets, activeAsset: SYMBOLS[0], liveTrading: false,
   riskPerTrade: 1, maxRiskPerTrade: 10, minRR: 2, lot: 0.02,
-  history: [], lastUpdate: null, uptimeStarted: new Date().toISOString()
+  history: signalHistory, lastUpdate: null, uptimeStarted: new Date().toISOString(),
+  historyPersistence: { file: HISTORY_FILE, loaded: signalHistory.length, durable: false }
 };
+
 let deriv = null;
 let token = null;
 const tf = (ms, t) => Math.floor(t / ms) * ms;
@@ -48,12 +83,7 @@ function analyze(a) {
   const zone = a.activeZone;
   if (!zone || a.price == null) return;
   const invalid = zone.type === 'demand' ? a.price < zone.low : a.price > zone.high;
-  if (invalid) {
-    zone.status = 'INVALIDATED';
-    a.history.unshift({ ...zone, event: 'ZONE INVALIDATED', timestamp: new Date().toISOString() });
-    a.history = a.history.slice(0, 25); state.history.unshift({ asset: a.name, event: 'ZONE INVALIDATED', timestamp: new Date().toISOString() });
-    state.history = state.history.slice(0, 50); a.activeZone = null; a.setupStatus = 'RESET'; a.signal = null; return;
-  }
+  if (invalid) { zone.status = 'INVALIDATED'; a.activeZone = null; a.setupStatus = 'RESET'; a.signal = null; return; }
   if (a.price >= zone.low && a.price <= zone.high) a.setupStatus = 'ZONE ENTRY';
 
   const r = m5.at(-2), q = m5.at(-3);
@@ -68,26 +98,28 @@ function analyze(a) {
   if (!bos) return;
   a.setupStatus = '5M BOS/CHOCH';
 
-  // A separate 15M close is required to break the opposite boundary; do not use it as the rejection exit.
   const closed15 = m15.at(-2);
   const zoneBreakout = zone.type === 'demand' ? closed15.close > zone.high : closed15.close < zone.low;
-  if (zoneBreakout) {
-    a.history.unshift({ ...zone, event: '15M ZONE BREAKOUT', timestamp: new Date().toISOString() });
-    a.history = a.history.slice(0, 25); a.activeZone = null; a.setupStatus = 'RESET'; return;
-  }
+  if (zoneBreakout) { a.activeZone = null; a.setupStatus = 'RESET'; return; }
 
   const key = `${zone.zoneId}-${r.time}-${zone.type}`;
-  if (a.lastSignalKey === key) return;
+  if (a.lastSignalKey === key || signalKeys.has(key)) return;
   const entry = a.price;
   const buffer = Math.max((zone.high - zone.low) * 0.1, entry * 0.0002);
   const sl = zone.type === 'demand' ? zone.low - buffer : zone.high + buffer;
   const risk = Math.abs(entry - sl);
   if (!risk) return;
   const tp = zone.type === 'demand' ? entry + risk * 2 : entry - risk * 2;
-  const signal = { asset: a.name, symbol: a.symbol, side: zone.type === 'demand' ? 'BUY' : 'SELL', entry, SL: sl, TP: tp, RR: 2, lot: state.lot, confidence: 70, timestamp: new Date().toISOString(), setup: '15M Zone → 5M Rejection → 5M BOS/CHOCH' };
+  const signal = { signalKey: key, asset: a.name, symbol: a.symbol, side: zone.type === 'demand' ? 'BUY' : 'SELL', entry, SL: sl, TP: tp, RR: 2, lot: state.lot, confidence: 70, timestamp: new Date().toISOString(), setup: '15M Zone → 5M Rejection → 5M BOS/CHOCH', result: 'OPEN', status: 'QUALIFIED' };
+
   a.signal = signal; a.lastSignalKey = key; a.setupStatus = 'QUALIFIED SIGNAL';
-  a.history.unshift({ ...signal, result: 'OPEN', status: 'QUALIFIED' }); a.history = a.history.slice(0, 25);
-  state.history.unshift({ ...signal, result: 'OPEN', status: 'QUALIFIED' }); state.history = state.history.slice(0, 50);
+  signalHistory.unshift(signal);
+  signalKeys.add(key);
+  state.history = signalHistory;
+  const durable = persistSignal();
+  state.historyPersistence.durable = durable;
+  state.historyPersistence.loaded = signalHistory.length;
+  a.history.unshift(signal);
 }
 
 function connect() {
@@ -115,11 +147,21 @@ function connect() {
   deriv.on('error', () => { state.connection = 'RECONNECTING'; });
 }
 
+app.get('/', (req, res) => {
+  try {
+    let html = fs.readFileSync(path.join(process.cwd(), 'public', 'index.html'), 'utf8');
+    html = html.replace(".filter(x=>x.status==='QUALIFIED').slice(0,20)", ".filter(x=>x.status==='QUALIFIED')");
+    res.type('html').send(html);
+  } catch { res.sendFile(path.join(process.cwd(), 'public', 'index.html')); }
+});
+app.use(express.static('public'));
+
 app.get('/api/state', (req, res) => {
   const safe = JSON.parse(JSON.stringify(state));
   for (const a of Object.values(safe.assets)) { a.candles5 = a.candles5.slice(-80); a.candles15 = a.candles15.slice(-80); }
   res.json(safe);
 });
+app.get('/api/history', (req, res) => res.json({ count: signalHistory.length, signals: signalHistory }));
 app.post('/api/live', (req, res) => { state.liveTrading = Boolean(req.body?.enabled); res.json({ liveTrading: state.liveTrading }); });
 app.post('/api/token', (req, res) => { token = typeof req.body?.token === 'string' && req.body.token ? req.body.token : null; res.json({ ok: Boolean(token), storedInMemory: true }); });
 app.post('/api/confirm', (req, res) => {
@@ -127,5 +169,6 @@ app.post('/api/confirm', (req, res) => {
   if (!token) return res.status(400).json({ error: 'Deriv token not connected' });
   return res.status(403).json({ error: 'Fresh per-trade confirmation is required; unattended real-money execution is disabled.' });
 });
-app.get('/health', (req, res) => res.json({ ok: true, connection: state.connection, assets: SYMBOLS, uptime: process.uptime() }));
-app.listen(PORT, () => { console.log(`LFSD scanner listening on ${PORT}`); connect(); });
+app.get('/health', (req, res) => res.json({ ok: true, connection: state.connection, assets: SYMBOLS, uptime: process.uptime(), signalHistoryCount: signalHistory.length, historyFile: HISTORY_FILE }));
+
+app.listen(PORT, () => { console.log(`LFSD scanner listening on ${PORT}`); console.log(`Loaded ${signalHistory.length} persisted qualified signals from ${HISTORY_FILE}`); connect(); });
